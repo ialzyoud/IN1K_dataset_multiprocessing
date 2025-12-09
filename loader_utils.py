@@ -1,89 +1,77 @@
 """
-# === Cell: SMOKE_IMAGE_LOADER ===============================================
+loader_utils.py
 
-Utility helpers to load a SMOKE subset of ImageNet images safely inside
-a notebook / interactive environment.
-
-This replaces the previous multiprocessing-based loader which failed with:
-"AttributeError: Can't get attribute '_read_one' on <module '__main__' (built-in)>"
-due to Python's pickling rules for spawned worker processes.
+Utilities for loading images (e.g., SMOKE subset) with optional multiprocessing.
 """
 
 from pathlib import Path
-from typing import List, Union, Optional
+from multiprocessing import Pool, cpu_count
+from typing import List, Tuple
 
 from PIL import Image
-from tqdm.auto import tqdm
-from multiprocessing.dummy import Pool as ThreadPool  # thread-based pool
 
 
-def _read_one(path: Union[str, Path]) -> Optional[Image.Image]:
+# ---------------------------------------------------------------------
+# Internal helper
+# ---------------------------------------------------------------------
+def _read_one(path: Path) -> Tuple[Path, Image.Image]:
     """
-    Read a single image from disk and return a PIL.Image.Image instance.
-
-    Returns:
-        PIL.Image.Image if successful, or None if the image could not be loaded.
-    """
-    try:
-        img = Image.open(path).convert("RGB")
-        return img
-    except Exception as e:
-        # You can log or collect the failing paths here if you like
-        # print(f"[WARN] Failed to read {path}: {e}")
-        return None
-
-
-def load_images_smoke(
-    paths: List[Union[str, Path]],
-    num_workers: int = 8,
-):
-    """
-    Load a SMOKE subset of ImageNet images using a thread pool.
-
-    This is notebook-safe and avoids multiprocessing pickling issues like:
-    "AttributeError: Can't get attribute '_read_one' on <module '__main__' (built-in)>".
+    Read a single image from disk.
 
     Args:
-        paths:
-            List of image paths (str or Path) to load.
-        num_workers:
-            Number of threads to use. If <= 1, falls back to single-threaded.
+        path: Path to an image file.
 
     Returns:
-        List of successfully loaded PIL.Image.Image objects.
-        Images that fail to load are skipped.
+        (path, PIL.Image) tuple. If reading fails, raises the original exception.
     """
-    n = len(paths)
-    if n == 0:
-        print("[SMOKE] No paths provided; nothing to load.")
+    img = Image.open(path).convert("RGB")
+    return path, img
+
+
+# ---------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------
+def load_images_smoke(
+    image_paths: List[Path],
+    num_workers: int | None = None
+) -> List[Tuple[Path, Image.Image]]:
+    """
+    Load a small SMOKE subset of images into memory.
+
+    This is the main entry point used by the notebook.
+
+    Args:
+        image_paths:
+            List of image file paths (typically a few thousand).
+        num_workers:
+            Number of worker processes for multiprocessing.
+            If None or <= 1, runs single-process.
+            If > 1, uses multiprocessing.Pool with that many workers,
+            capped at the physical cpu_count().
+
+    Returns:
+        List of (path, PIL.Image) tuples in the same order as image_paths.
+    """
+    if not image_paths:
         return []
 
-    paths = [str(p) for p in paths]  # ensure simple pickleable/serializable types
+    if num_workers is None or num_workers <= 1:
+        # --- single-process path (safe everywhere) ---
+        out: List[Tuple[Path, Image.Image]] = []
+        for p in image_paths:
+            out.append(_read_one(p))
+        return out
 
-    if num_workers is None or num_workers < 1:
-        num_workers = 1
+    # --- multiprocessing path ---
+    n_workers = min(num_workers, cpu_count())
+    print(f"[SMOKE] Loading {len(image_paths)} images using multiprocessing "
+          f"with {n_workers} workers...")
 
-    print(f"[SMOKE] Loading {n} images using {num_workers} thread(s)...")
+    with Pool(processes=n_workers) as pool:
+        # imap_unordered is usually faster; we re-order to match input order
+        results_unordered = list(pool.imap_unordered(_read_one, image_paths))
 
-    if num_workers == 1:
-        # Simple single-threaded fallback
-        imgs = []
-        for p in tqdm(paths, desc="[SMOKE] Loading (1 worker)"):
-            img = _read_one(p)
-            if img is not None:
-                imgs.append(img)
-    else:
-        # Threaded loading (safe in notebooks / REPL)
-        with ThreadPool(num_workers) as pool:
-            results = list(
-                tqdm(
-                    pool.imap(_read_one, paths),
-                    total=len(paths),
-                    desc=f"[SMOKE] Loading ({num_workers} threads)",
-                )
-            )
-        # Filter out failed reads
-        imgs = [im for im in results if im is not None]
-
-    print(f"[SMOKE] Loaded {len(imgs)} / {n} images successfully.")
-    return imgs
+    # Reorder results to match the original image_paths order
+    path_to_img = {p: img for p, img in results_unordered}
+    ordered = [(p, path_to_img[p]) for p in image_paths if p in path_to_img]
+    return ordered
