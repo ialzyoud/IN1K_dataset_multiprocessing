@@ -1,77 +1,108 @@
+# ============================================================
+# loader_utils.py — Image loading helpers for SMOKE experiments
+# ============================================================
 """
-loader_utils.py
+Utility functions to load image data for the SMOKE subset.
 
-Utilities for loading images (e.g., SMOKE subset) with optional multiprocessing.
+Main entry point:
+    - load_images_smoke(paths, num_workers=8)
+
+This is designed to be imported from your notebook, e.g.:
+
+    from loader_utils import load_images_smoke
 """
 
 from pathlib import Path
 from multiprocessing import Pool, cpu_count
-from typing import List, Tuple
+from typing import Iterable, List, Tuple, Optional
 
 from PIL import Image
 
 
-# ---------------------------------------------------------------------
-# Internal helper
-# ---------------------------------------------------------------------
-def _read_one(path: Path) -> Tuple[Path, Image.Image]:
+# -----------------------------
+# Internal helpers (top-level!)
+# -----------------------------
+def _read_one(path_str: str) -> Tuple[str, Image.Image]:
     """
-    Read a single image from disk.
+    Read a single image from disk and convert it to RGB.
 
     Args:
-        path: Path to an image file.
+        path_str: String path to the image.
 
     Returns:
-        (path, PIL.Image) tuple. If reading fails, raises the original exception.
+        (path_str, PIL.Image.Image)
     """
-    img = Image.open(path).convert("RGB")
-    return path, img
+    p = Path(path_str)
+    img = Image.open(p).convert("RGB")
+    return path_str, img
 
 
-# ---------------------------------------------------------------------
+def _read_one_safe(path_str: str) -> Optional[Tuple[str, Image.Image]]:
+    """
+    Safe wrapper around _read_one() that catches exceptions.
+
+    Returns:
+        (path_str, image) on success, or None if failed.
+    """
+    try:
+        return _read_one(path_str)
+    except Exception as e:
+        print(f"[WARN] Failed to read {path_str}: {e}")
+        return None
+
+
+# --------------------------------------------------------
 # Public API
-# ---------------------------------------------------------------------
+# --------------------------------------------------------
 def load_images_smoke(
-    image_paths: List[Path],
-    num_workers: int | None = None
-) -> List[Tuple[Path, Image.Image]]:
+    paths: Iterable[Path],
+    num_workers: int = 8,
+) -> List[Tuple[str, Image.Image]]:
     """
-    Load a small SMOKE subset of images into memory.
+    CELL B — Load SMOKE images into memory
 
-    This is the main entry point used by the notebook.
+    Purpose:
+        Load a list of image files into memory as (path, PIL.Image) tuples.
+        Can run single-threaded or with multiprocessing.
 
     Args:
-        image_paths:
-            List of image file paths (typically a few thousand).
+        paths:
+            Iterable of pathlib.Path objects pointing to image files.
         num_workers:
-            Number of worker processes for multiprocessing.
-            If None or <= 1, runs single-process.
-            If > 1, uses multiprocessing.Pool with that many workers,
-            capped at the physical cpu_count().
+            - 1 or <=0 → single-process (no multiprocessing)
+            - >1       → use multiprocessing.Pool with that many workers
+                         (capped at cpu_count()).
 
     Returns:
-        List of (path, PIL.Image) tuples in the same order as image_paths.
+        List of (path_str, PIL.Image.Image) tuples.
     """
-    if not image_paths:
+    path_strs = [str(p) for p in paths]
+
+    if not path_strs:
+        print("[SMOKE] No paths provided to load_images_smoke().")
         return []
 
+    # Single-process path (easier for debugging)
     if num_workers is None or num_workers <= 1:
-        # --- single-process path (safe everywhere) ---
-        out: List[Tuple[Path, Image.Image]] = []
-        for p in image_paths:
-            out.append(_read_one(p))
+        print(f"[SMOKE] Loading {len(path_strs)} images in a single process...")
+        out: List[Tuple[str, Image.Image]] = []
+        for ps in path_strs:
+            try:
+                out.append(_read_one(ps))
+            except Exception as e:
+                print(f"[WARN] Failed to read {ps}: {e}")
+        print(f"[SMOKE] Loaded {len(out)}/{len(path_strs)} images successfully.")
         return out
 
-    # --- multiprocessing path ---
-    n_workers = min(num_workers, cpu_count())
-    print(f"[SMOKE] Loading {len(image_paths)} images using multiprocessing "
-          f"with {n_workers} workers...")
+    # Multiprocessing path
+    workers = min(num_workers, cpu_count())
+    print(f"[SMOKE] Loading {len(path_strs)} images using multiprocessing ({workers} workers)...")
 
-    with Pool(processes=n_workers) as pool:
-        # imap_unordered is usually faster; we re-order to match input order
-        results_unordered = list(pool.imap_unordered(_read_one, image_paths))
+    with Pool(processes=workers) as pool:
+        # chunksize can be tuned; 16 is usually reasonable
+        results = pool.map(_read_one_safe, path_strs, chunksize=16)
 
-    # Reorder results to match the original image_paths order
-    path_to_img = {p: img for p, img in results_unordered}
-    ordered = [(p, path_to_img[p]) for p in image_paths if p in path_to_img]
-    return ordered
+    samples = [r for r in results if r is not None]
+    print(f"[SMOKE] Loaded {len(samples)}/{len(path_strs)} images successfully.")
+
+    return samples
